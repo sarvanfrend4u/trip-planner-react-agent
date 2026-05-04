@@ -1,152 +1,193 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { toolDefinitions, executeTool } from "./tools.js";
-
 // ─────────────────────────────────────────────
-// SYSTEM PROMPT
-// Tells Gemini its role, reasoning rules, and
-// what process to follow. This is the "React"
-// part — it enforces Thought → Action → Observe.
+// REACT AGENT — ORCHESTRATOR
+//
+// Routes the query to the right flow:
+//
+//   Multi-city trip  → Plan & Execute
+//   Tight budget     → Tree of Thoughts first
+//   Standard trip    → ReAct loop
+//
+// All flows then go through:
+//   Self-Refine  → critique and improve the draft
+//   Reflexion    → retry if over budget
+//
+// Memory and rules are loaded by the caller (App.jsx)
+// and injected into the system prompt here.
 // ─────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are a trip cost planning assistant. Your job is to research real travel costs and give users an accurate budget breakdown.
+import { GoogleGenerativeAI } from "@google/generative-ai"
+import { toolDefinitions, executeTool } from "./tools.js"
+import { refineAnswer } from "./selfRefine.js"
+import { runWithReflexion } from "./reflexion.js"
+import { isMultiCity, planAndExecute } from "./planExecute.js"
+import { isTightBudget, treeOfThoughts } from "./treeOfThoughts.js"
+
+const BASE_SYSTEM_PROMPT =
+`You are a trip cost planning assistant. Your job is to research real travel costs and give users an accurate budget breakdown.
 
 You have two tools:
 - web_search: search the web for real travel costs (flights, hotels, food, activities)
 - calculate_total: sum all costs and check against the user's budget
 
-Process you must follow:
-1. Before every tool call, write one sentence explaining WHY you are calling it
-2. Search for each cost category separately: flights, hotels, food, activities
-3. Use specific queries like "Chennai to Goa round trip flight cost 2 passengers June 2025"
-4. Once you have gathered all costs, call calculate_total
-5. End with a clear formatted breakdown using ₹ amounts
+Chain of Thought — before your first tool call, write out:
+1. What cost categories do I need to research? (flights, hotels, food, activities, local transport, visa if international)
+2. What specific search query will I use for each category?
+3. What order will I search in?
 
 Rules:
 - Never guess or assume numbers — always use web_search to get real data
 - Search for each category one at a time
-- Always call calculate_total as your last tool call before the final answer`;
+- Always call calculate_total as your last tool call
+- Always use ₹ (INR) amounts
+- Always include a 10% contingency buffer in the final total`
 
-// ─────────────────────────────────────────────
-// MAIN AGENT FUNCTION
-//
-// userQuery  — the trip planning request from the user
-// onStep     — callback called for every reasoning step
-//              so the UI can display it live
-//
-// Step types emitted:
-//   { type: "thought",      content: string }
-//   { type: "action",       tool: string, args: object }
-//   { type: "observation",  result: object }
-//   { type: "final_answer", content: string }
-//   { type: "error",        message: string }
-// ─────────────────────────────────────────────
+// Build the full system prompt by combining:
+//   base instructions + user-confirmed rules + user facts from memory
+export function buildSystemPrompt(memory, rules, customPrompt) {
+  let prompt = customPrompt || BASE_SYSTEM_PROMPT
 
-export async function runTripAgent(userQuery, onStep) {
-  const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY);
-
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.0-flash",
-    tools: [{ functionDeclarations: toolDefinitions }],
-    systemInstruction: SYSTEM_PROMPT,
-  });
-
-  // Start a multi-turn chat — Gemini remembers the full
-  // conversation history including tool results
-  const chat = model.startChat();
-
-  // The first message is the user's trip query.
-  // After each tool call, we send the tool result back
-  // as the next message.
-  let message = userQuery;
-
-  // Safety cap — prevents infinite loops if Gemini
-  // keeps calling tools without reaching a final answer
-  const MAX_ITERATIONS = 10;
-
-  for (let i = 0; i < MAX_ITERATIONS; i++) {
-    let response;
-
-    try {
-      const result = await chat.sendMessage(message);
-      response = result.response;
-    } catch (err) {
-      onStep({ type: "error", message: `Gemini API error: ${err.message}` });
-      return;
-    }
-
-    const parts = response.candidates?.[0]?.content?.parts ?? [];
-
-    // A response can have text parts (reasoning) and/or
-    // a functionCall part (tool request) in the same turn.
-    const textParts = parts.filter((p) => p.text);
-    const funcPart  = parts.find((p) => p.functionCall);
-
-    // ── TOOL CALL TURN ──────────────────────────────────
-    if (funcPart) {
-      const { name, args } = funcPart.functionCall;
-
-      // Emit the thought — either what Gemini wrote before
-      // calling the tool, or a synthesized fallback
-      const thoughtText =
-        textParts.length > 0
-          ? textParts.map((p) => p.text).join(" ").trim()
-          : synthesizeThought(name, args);
-
-      onStep({ type: "thought", content: thoughtText });
-
-      // Emit the action so the UI shows the tool + args
-      onStep({ type: "action", tool: name, args });
-
-      // Run the actual tool function
-      let toolResult;
-      try {
-        toolResult = await executeTool(name, args);
-      } catch (err) {
-        toolResult = { error: err.message };
-      }
-
-      // Emit the observation so the UI shows what the tool returned
-      onStep({ type: "observation", result: toolResult });
-
-      // Feed the tool result back to Gemini as a functionResponse
-      // so it can continue reasoning in the next turn
-      message = [
-        {
-          functionResponse: {
-            name,
-            response: { result: toolResult },
-          },
-        },
-      ];
-
-    // ── FINAL ANSWER TURN ────────────────────────────────
-    } else {
-      const finalText = textParts.map((p) => p.text).join("\n").trim();
-      onStep({ type: "final_answer", content: finalText });
-      return;
-    }
+  if (rules.length > 0) {
+    prompt += "\n\nStanding instructions from this user:\n"
+    rules.forEach(r => { prompt += `- ${r}\n` })
   }
 
-  // If we hit the iteration cap without a final answer
-  onStep({
-    type: "error",
-    message: "Agent reached maximum steps without a final answer.",
-  });
+  if (memory.length > 0) {
+    prompt += "\n\nWhat you know about this user:\n"
+    memory.forEach(m => { prompt += `- ${m}\n` })
+  }
+
+  return prompt
 }
 
-// ─────────────────────────────────────────────
-// THOUGHT SYNTHESIZER
-// When Gemini jumps straight to a function call
-// without any text, we generate a readable thought
-// so the UI always has something to show.
-// ─────────────────────────────────────────────
+// ── Main agent entry point ───────────────────
+export async function runTripAgent(userQuery, onStep, context = {}) {
+  const { memory = [], rules = [], systemPrompt = null } = context
+  const apiKey     = import.meta.env.VITE_GEMINI_API_KEY
+  const fullPrompt = buildSystemPrompt(memory, rules, systemPrompt)
+  const genAI      = new GoogleGenerativeAI(apiKey)
+
+  // ── Route: multi-city → Plan & Execute ──────
+  if (isMultiCity(userQuery)) {
+    const result  = await planAndExecute(userQuery, apiKey, onStep)
+    const model   = genAI.getGenerativeModel({ model: "gemini-2.0-flash" })
+    const refined = await refineAnswer(userQuery, result, model)
+    const final   = await runWithReflexion(userQuery, refined, model, onStep)
+    onStep({ type: "final_answer", content: final })
+    return { answer: final }
+  }
+
+  const model = genAI.getGenerativeModel({
+    model:             "gemini-2.0-flash",
+    tools:             [{ functionDeclarations: toolDefinitions }],
+    systemInstruction: fullPrompt,
+  })
+
+  // ── Route: tight budget → Tree of Thoughts ──
+  let queryToUse = userQuery
+  if (isTightBudget(userQuery)) {
+    const chosenApproach = await treeOfThoughts(userQuery, apiKey, onStep)
+    queryToUse = userQuery + "\n\nUse this approach: " + chosenApproach
+  }
+
+  // ── Standard ReAct loop ──────────────────────
+  const chat          = model.startChat()
+  let   message       = queryToUse
+  const MAX_ITERATIONS = 12
+  let   draftAnswer   = null
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    let response
+    try {
+      const result = await chat.sendMessage(message)
+      response     = result.response
+    } catch (err) {
+      onStep({ type: "error", message: `Gemini API error: ${err.message}` })
+      return
+    }
+
+    const parts     = response.candidates?.[0]?.content?.parts ?? []
+    const textParts = parts.filter(p => p.text)
+    const funcPart  = parts.find(p => p.functionCall)
+
+    if (funcPart) {
+      const { name, args } = funcPart.functionCall
+
+      const thoughtText = textParts.length > 0
+        ? textParts.map(p => p.text).join(" ").trim()
+        : synthesizeThought(name, args)
+
+      onStep({ type: "thought",      content: thoughtText })
+      onStep({ type: "action",       tool: name, args })
+
+      let toolResult
+      try   { toolResult = await executeTool(name, args) }
+      catch (err) { toolResult = { error: err.message } }
+
+      onStep({ type: "observation", result: toolResult })
+
+      message = [{ functionResponse: { name, response: { result: toolResult } } }]
+    } else {
+      draftAnswer = textParts.map(p => p.text).join("\n").trim()
+      break
+    }
+  }
+
+  if (!draftAnswer) {
+    onStep({ type: "error", message: "Agent reached maximum steps without a final answer." })
+    return
+  }
+
+  // ── Self-Refine ──────────────────────────────
+  onStep({ type: "thought", content: "Reviewing and refining the plan..." })
+  const refined = await refineAnswer(userQuery, draftAnswer, model)
+
+  // ── Reflexion ────────────────────────────────
+  const final = await runWithReflexion(userQuery, refined, model, onStep)
+
+  onStep({ type: "final_answer", content: final })
+  return { answer: final }
+}
+
+// ── Session learning extractor ───────────────
+// Called after each session to extract facts and
+// rules from what happened in the conversation.
+export async function extractSessionLearnings(query, answer, apiKey) {
+  const genAI = new GoogleGenerativeAI(apiKey)
+  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" })
+
+  const result = await model.generateContent(`
+Analyze this trip planning session and extract two types of learnings.
+
+User query: "${query}"
+Answer summary: "${answer.slice(0, 600)}"
+
+FACTS: Personal facts about the user revealed in this session.
+  - Only things explicitly stated (companions, dietary needs, home city, budget range, preferences)
+  - Do not infer or guess
+
+RULES: Behavioural rules the agent should follow in future sessions.
+  - Based on what the user asked for or what the plan required
+  - Only rules that would genuinely improve future responses
+
+Reply with JSON only, no markdown:
+{"facts": ["fact1", "fact2"], "rules": ["rule1", "rule2"]}
+
+Return empty arrays if nothing clearly useful was revealed.
+`)
+
+  try {
+    const text = result.response.text().trim()
+    const json = text.match(/\{[\s\S]*\}/)?.[0]
+    return JSON.parse(json)
+  } catch {
+    return { facts: [], rules: [] }
+  }
+}
+
+// ── Internal helpers ─────────────────────────
 
 function synthesizeThought(toolName, args) {
-  if (toolName === "web_search") {
-    return `Searching for: "${args.query}"`;
-  }
-  if (toolName === "calculate_total") {
-    return "I have all the cost data. Calculating total and checking the budget.";
-  }
-  return `Calling ${toolName}...`;
+  if (toolName === "web_search")      return `Searching for: "${args.query}"`
+  if (toolName === "calculate_total") return "I have all the cost data. Calculating total and checking the budget."
+  return `Calling ${toolName}...`
 }
